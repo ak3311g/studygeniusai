@@ -1,60 +1,67 @@
-// Centralizes all Gemini API concerns: endpoint construction, retry policy,
-// and response parsing. Keeping this out of the component means it can be
-// unit-tested without rendering React at all.
+import { GoogleGenAI } from "@google/genai";
+
+export const DEFAULT_MODEL = "gemini-3.6-flash";
 
 const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 
-/**
- * Returns true if a failed HTTP response is worth retrying.
- * 4xx errors (bad request, bad API key, invalid model) will never succeed
- * on retry - only network failures and 5xx/429 should be retried.
- */
 function isRetryableStatus(status) {
-  if (status === 429) return true; // rate limited
+  if (status === 429) return true;
   return status >= 500;
 }
 
-export async function callGeminiAPI(payload, apiKey, { signal } = {}) {
+function getStatusFromError(err) {
+  return err?.status ?? err?.response?.status ?? err?.error?.code;
+}
+
+export async function generateStudyPackJson({
+  textContent,
+  subjectDomain,
+  gradeLevel,
+  apiKey,
+  model = DEFAULT_MODEL,
+  signal,
+}) {
   const key = (apiKey || "").trim();
   if (!key) {
     throw new Error("Please enter your Gemini API Key in the settings field.");
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${encodeURIComponent(key)}`;
+  const ai = new GoogleGenAI({ apiKey: key });
+  const systemInstruction = buildSystemInstruction({ subjectDomain, gradeLevel });
 
   let lastError;
 
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal,
+      const response = await ai.models.generateContent({
+        model,
+        contents: `TEXTBOOK CONTENT:\n${textContent}`,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          abortSignal: signal,
+        },
       });
 
-      if (!response.ok) {
-        let detail = "";
-        try {
-          const errBody = await response.json();
-          detail = errBody?.error?.message ? `: ${errBody.error.message}` : "";
-        } catch {
-          /* response body wasn't JSON, ignore */
-        }
-        const err = new Error(`API Error HTTP ${response.status}${detail}`);
-        err.status = response.status;
-        throw err;
-      }
-
-      return await response.json();
+      const text = response?.text;
+      if (!text) throw new Error("Empty response received from AI engine.");
+      return JSON.parse(text);
     } catch (err) {
-      if (err?.name === "AbortError") throw err; // never retry a deliberate cancel
+      if (err?.name === "AbortError") throw err;
       lastError = err;
 
-      const retryable = err.status ? isRetryableStatus(err.status) : true; // network errors -> retry
+      const status = getStatusFromError(err);
+      const retryable = status ? isRetryableStatus(status) : true;
       const isLastAttempt = attempt === RETRY_DELAYS_MS.length;
 
-      if (!retryable || isLastAttempt) throw err;
+      if (!retryable || isLastAttempt) {
+        if (status === 404) {
+          throw new Error(
+            `Model "${model}" was not found or doesn't support generateContent. Double check the model id.`
+          );
+        }
+        throw err;
+      }
 
       await new Promise((res) => setTimeout(res, RETRY_DELAYS_MS[attempt]));
     }
@@ -63,33 +70,20 @@ export async function callGeminiAPI(payload, apiKey, { signal } = {}) {
   throw lastError;
 }
 
-export function extractJsonText(responseData) {
-  const rawJsonStr = responseData?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!rawJsonStr) throw new Error("Empty response received from AI engine.");
-  return rawJsonStr;
-}
-
-/**
- * Light structural validation so a malformed AI response fails with a clear
- * error message instead of throwing deep inside a render (e.g. "cannot read
- * property 'map' of undefined").
- */
 export function validateStudyData(data) {
   const problems = [];
   if (!data || typeof data !== "object") return ["Response was not a JSON object."];
-
   if (!Array.isArray(data.mcqQuiz20)) problems.push("mcqQuiz20 is missing or not an array");
   if (!Array.isArray(data.flashcards10)) problems.push("flashcards10 is missing or not an array");
   if (!data.downloadableWorksheet30 || typeof data.downloadableWorksheet30 !== "object") {
     problems.push("downloadableWorksheet30 is missing");
   }
   if (!Array.isArray(data.practicalActivities)) problems.push("practicalActivities is missing or not an array");
-
   return problems;
 }
 
-export function buildStudyPackPayload({ textContent, subjectDomain, gradeLevel }) {
-  const systemPrompt = `You are an expert curriculum developer and scientific textbook creator.
+function buildSystemInstruction({ subjectDomain, gradeLevel }) {
+  return `You are an expert curriculum developer and scientific textbook creator.
 
 Subject Domain: ${subjectDomain}.
 Grade Level: ${gradeLevel}.
@@ -110,10 +104,4 @@ downloadableWorksheet30: An assessment worksheet with EXACTLY 30 total questions
 flashcards10: Array of EXACTLY 10 flashcards, each with: id (1-10), front, back
 
 STRICT RULE: Include EXACTLY 20 MCQs, EXACTLY 30 worksheet questions (10+5+8+7=30), and EXACTLY 10 flashcards. Do not omit any items!`;
-
-  return {
-    contents: [{ parts: [{ text: `TEXTBOOK CONTENT:\n${textContent}` }] }],
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    generationConfig: { responseMimeType: "application/json" },
-  };
 }
