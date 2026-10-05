@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 
-export const DEFAULT_MODEL = "gemini-3.6-flash";
+export const DEFAULT_MODEL = "gemini-3.8-flash";
 
 const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 
